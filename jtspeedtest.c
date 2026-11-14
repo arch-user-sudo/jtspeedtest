@@ -10,7 +10,7 @@
  *
  * Controls:
  *   Space / Enter   start or stop a test
- *   Esc / q         quit
+ *   Esc / q / x     quit (stops a running test first)
  *   Click gauge     start a test (when idle)
  *   Drag header     move the window
  *
@@ -915,7 +915,6 @@ typedef struct {
     double disp;
     int hover_start;
     int press_start;
-    int hover_close;
     double done_t;
 } View;
 
@@ -1340,6 +1339,7 @@ static void paint_button(cairo_t *cr, const View *v, int running)
 
 static void paint_header(cairo_t *cr, const View *v, int running)
 {
+    (void)v;
     (void)running;
 
     /* small equaliser mark */
@@ -1359,21 +1359,6 @@ static void paint_header(cairo_t *cr, const View *v, int running)
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 24.0, 54.5);
     cairo_line_to(cr, WIN_W - 24.0, 54.5);
-    cairo_stroke(cr);
-
-    double ccx = WIN_W - 30.0;
-    double ccy = 28.0;
-    if (v->hover_close) {
-        rgba(cr, C_FG, 0.07);
-        cairo_arc(cr, ccx, ccy, 15.0, 0.0, 2.0 * PI);
-        cairo_fill(cr);
-    }
-    rgba(cr, v->hover_close ? C_FG : C_DIM, v->hover_close ? 0.9 : 0.62);
-    cairo_set_line_width(cr, 1.35);
-    cairo_move_to(cr, ccx - 5.0, ccy - 5.0);
-    cairo_line_to(cr, ccx + 5.0, ccy + 5.0);
-    cairo_move_to(cr, ccx + 5.0, ccy - 5.0);
-    cairo_line_to(cr, ccx - 5.0, ccy + 5.0);
     cairo_stroke(cr);
 }
 
@@ -1396,7 +1381,7 @@ static void paint_content(cairo_t *cr, const View *v)
     int done = s->phase == PH_DONE;
 
     cairo_save(cr);
-    rounded_rect(cr, 0.5, 0.5, WIN_W - 1.0, WIN_H - 1.0, 12.0);
+    cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
     cairo_clip(cr);
 
     cairo_pattern_t *bg = cairo_pattern_create_linear(0.0, 0.0, 0.0, WIN_H);
@@ -1449,11 +1434,6 @@ static void paint_content(cairo_t *cr, const View *v)
     paint_footer(cr, v, running);
 
     cairo_restore(cr);
-
-    rgba(cr, C_BORDER, 1.0);
-    cairo_set_line_width(cr, 1.0);
-    rounded_rect(cr, 0.5, 0.5, WIN_W - 1.0, WIN_H - 1.0, 12.0);
-    cairo_stroke(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1522,7 +1502,6 @@ struct App {
 
     int hover_start;
     int press_start;
-    int hover_close;
     int quit;
 
     double pointer_x, pointer_y;
@@ -1538,11 +1517,6 @@ static int hit_start(double x, double y)
 {
     return x >= (WIN_W - 200.0) / 2.0 && x <= (WIN_W + 200.0) / 2.0 &&
            y >= 532.0 && y <= 578.0;
-}
-
-static int hit_close(double x, double y)
-{
-    return x >= WIN_W - 48.0 && y <= 56.0;
 }
 
 static int hit_gauge(double x, double y)
@@ -1563,7 +1537,7 @@ static void update_cursor(App *a)
     }
 
     uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
-    if (a->hover_close || a->hover_start ||
+    if (a->hover_start ||
         (hit_gauge(a->pointer_x, a->pointer_y) && !net_running(&a->net))) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
     } else if (a->pointer_x >= 0.0 && a->pointer_y >= 0.0 &&
@@ -1805,7 +1779,6 @@ static void app_draw(App *a, const Snap *s)
     v.disp = a->disp;
     v.hover_start = a->hover_start;
     v.press_start = a->press_start;
-    v.hover_close = a->hover_close;
     v.done_t = a->done_t;
 
     paint_content(cr, &v);
@@ -2010,7 +1983,6 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
     a->pointer_y = wl_fixed_to_double(sy);
     a->cursor_shape = 0;
     a->hover_start = hit_start(a->pointer_x, a->pointer_y);
-    a->hover_close = hit_close(a->pointer_x, a->pointer_y);
     update_cursor(a);
 }
 
@@ -2022,7 +1994,6 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     a->pointer_x = -1;
     a->pointer_y = -1;
     a->hover_start = 0;
-    a->hover_close = 0;
     a->press_start = 0;
     update_cursor(a);
 }
@@ -2035,7 +2006,6 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
     a->hover_start = hit_start(a->pointer_x, a->pointer_y);
-    a->hover_close = hit_close(a->pointer_x, a->pointer_y);
     update_cursor(a);
 }
 
@@ -2053,12 +2023,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     double x = a->pointer_x;
     double y = a->pointer_y;
     a->hover_start = hit_start(x, y);
-    a->hover_close = hit_close(x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (hit_close(x, y)) {
-            a->quit = 1;
-        } else if (hit_start(x, y)) {
+        if (hit_start(x, y)) {
             a->press_start = 1;
         } else if (y < 56.0) {
             if (a->toplevel && a->seat)
@@ -2175,7 +2142,10 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         return;
 
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
-    if (sym == XKB_KEY_Escape || sym == XKB_KEY_q) {
+    if (sym == XKB_KEY_Escape || sym == XKB_KEY_q || sym == XKB_KEY_x) {
+        /* Stop any running test first so shutdown does not have to
+         * wait for the worker thread to finish on its own. */
+        stop_test(a);
         a->quit = 1;
     } else if (sym == XKB_KEY_space || sym == XKB_KEY_Return ||
                sym == XKB_KEY_KP_Enter) {
@@ -2358,7 +2328,7 @@ static int wayland_start(App *a)
         zxdg_toplevel_decoration_v1_add_listener(
             a->decoration, &decoration_listener, a);
         zxdg_toplevel_decoration_v1_set_mode(
-            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
     if (a->icon_manager) {
@@ -2734,7 +2704,6 @@ static int write_screenshot(const char *path)
     v.disp = 287.4;
     v.hover_start = 0;
     v.press_start = 0;
-    v.hover_close = 0;
     v.done_t = -1.0;
 
     paint_content(cr, &v);
