@@ -63,8 +63,18 @@
 /*  Look & feel                                                        */
 /* ------------------------------------------------------------------ */
 
-#define WIN_W 540.0
-#define WIN_H 640.0
+#define DESIGN_W 540.0
+#define DESIGN_H 640.0
+static double WIN_W = DESIGN_W;
+static double WIN_H = DESIGN_H;
+
+/* Extra vertical room above the design layout.  The gauge/cards block is
+ * centred in the space between the fixed header and the anchored footer. */
+static double content_dy(void)
+{
+    double dy = (WIN_H - DESIGN_H) / 2.0;
+    return dy > 0.0 ? dy : 0.0;
+}
 
 #define FONT_FAMILY "Liberation"
 
@@ -957,7 +967,7 @@ static double gauge_ratio(double mbps)
     return r;
 }
 
-#define GAUGE_CX 270.0
+#define GAUGE_CX (WIN_W / 2.0)
 #define GAUGE_CY 208.0
 #define GAUGE_R  98.0
 #define GAUGE_A0 (3.0 * PI / 4.0)
@@ -1367,11 +1377,12 @@ static void paint_footer(cairo_t *cr, const View *v, int running)
     (void)running;
 
     const char *server = v->s->server[0] ? v->s->server : "Cloudflare";
+    double y = WIN_H - 37.0;
     text_draw(cr, server, 9.5, 400, C_FAINT, 0.82,
-              24.0, 603.0, ALIGN_LEFT, 0.25);
+              24.0, y, ALIGN_LEFT, 0.25);
 
     text_draw(cr, "SPACE  START     ESC  QUIT", 9.0, 600, C_FAINT, 0.60,
-              WIN_W - 24.0, 603.0, ALIGN_RIGHT, 1.1);
+              WIN_W - 24.0, y, ALIGN_RIGHT, 1.1);
 }
 
 static void paint_content(cairo_t *cr, const View *v)
@@ -1397,8 +1408,17 @@ static void paint_content(cairo_t *cr, const View *v)
 
     paint_ambient(cr, v, running, done);
     paint_dust(cr, v, running);
+
+    double dy = content_dy();
+    cairo_save(cr);
+    cairo_translate(cr, 0.0, dy);
     paint_rings(cr, v, running, done);
+    cairo_restore(cr);
+
     paint_header(cr, v, running);
+
+    cairo_save(cr);
+    cairo_translate(cr, 0.0, dy);
     paint_gauge(cr, v, running);
     paint_phase_bar(cr, v);
 
@@ -1415,7 +1435,8 @@ static void paint_content(cairo_t *cr, const View *v)
     fmt_ms(v3, sizeof v3, pg);
     fmt_ms(v4, sizeof v4, jt);
 
-    double x0 = 24.0, gap = 12.0, cw = 240.0, ch = 66.0;
+    double x0 = 24.0, gap = 12.0, ch = 66.0;
+    double cw = (WIN_W - x0 * 2.0 - gap) / 2.0;
     double y1 = 366.0, y2 = 444.0;
 
     paint_card(cr, v, x0, y1, cw, ch,
@@ -1431,6 +1452,8 @@ static void paint_content(cairo_t *cr, const View *v)
                "JITTER", v4, "ms", C_FG, 0);
 
     paint_button(cr, v, running);
+    cairo_restore(cr);
+
     paint_footer(cr, v, running);
 
     cairo_restore(cr);
@@ -1515,15 +1538,17 @@ struct App {
 
 static int hit_start(double x, double y)
 {
+    double dy = content_dy();
     return x >= (WIN_W - 200.0) / 2.0 && x <= (WIN_W + 200.0) / 2.0 &&
-           y >= 532.0 && y <= 578.0;
+           y >= 532.0 + dy && y <= 578.0 + dy;
 }
 
 static int hit_gauge(double x, double y)
 {
+    double dy = content_dy();
     double dx = x - GAUGE_CX;
-    double dy = y - GAUGE_CY;
-    return dx * dx + dy * dy <= 112.0 * 112.0;
+    double gy = y - (GAUGE_CY + dy);
+    return dx * dx + gy * gy <= 112.0 * 112.0;
 }
 
 static void update_cursor(App *a)
@@ -1768,7 +1793,7 @@ static void app_draw(App *a, const Snap *s)
 
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_set_source_rgba(cr, R_(C_BG), G_(C_BG), B_(C_BG), 1.0);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
@@ -1867,11 +1892,13 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
                                int32_t width, int32_t height,
                                struct wl_array *states)
 {
-    (void)data;
     (void)t;
-    (void)width;
-    (void)height;
     (void)states;
+    (void)data;
+    if (width > 0 && height > 0) {
+        WIN_W = width;
+        WIN_H = height;
+    }
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *t)
@@ -2319,8 +2346,7 @@ static int wayland_start(App *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Speedtest");
     xdg_toplevel_set_app_id(a->toplevel, "jtspeedtest");
-    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W, (int)WIN_H);
-    xdg_toplevel_set_max_size(a->toplevel, (int)WIN_W, (int)WIN_H);
+    xdg_toplevel_set_min_size(a->toplevel, (int)DESIGN_W, (int)DESIGN_H);
 
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
