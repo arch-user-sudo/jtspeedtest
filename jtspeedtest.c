@@ -1052,16 +1052,27 @@ static void paint_ambient(cairo_t *cr, const View *v, int running, int done)
 
 static void paint_dust(cairo_t *cr, const View *v, int running)
 {
+    /* The dust is laid out in design space; map it onto the current
+     * window so it stays spread across the background after a resize. */
+    double sx = WIN_W / DESIGN_W;
+    double sy = WIN_H / DESIGN_H;
+    const double x_margin = 34.0;
+    const double x_span = DESIGN_W - 2.0 * x_margin;
+    const double y_span = 328.0;
+    const double y_bottom = 332.0;
+
     for (int i = 0; i < 26; i++) {
         double seed = (double)(i + 1) * 12.9898;
-        double base_x = 34.0 + fmod(seed * 37.719, 472.0);
+        double base_x = (x_margin + fmod(seed * 37.719, x_span)) * sx;
         double speed = 5.0 + fmod(seed * 11.13, 13.0);
-        double span = 328.0;
-        double drift = fmod(seed * 19.19 +
-                            v->t * speed * (running ? 1.55 : 1.0), span);
-        double y = 332.0 - drift;
+        /* Normalised phase keeps each mote in place across a resize. */
+        double ph = fmod((seed * 19.19 +
+                          v->t * speed * (running ? 1.55 : 1.0)) / y_span, 1.0);
+        if (ph < 0.0)
+            ph += 1.0;
+        double y = (y_bottom - ph * y_span) * sy;
         double x = base_x + sin(v->t * 0.33 + i * 1.7) *
-                   (5.0 + fmod(seed * 3.3, 7.0));
+                   (5.0 + fmod(seed * 3.3, 7.0)) * sx;
         double a = (0.035 + 0.075 * (0.5 + 0.5 *
                    sin(v->t * 0.5 + i * 2.1))) * (running ? 1.55 : 1.0);
         double rad = 0.7 + fmod(seed * 5.7, 1.25);
@@ -1132,10 +1143,13 @@ static void paint_gauge(cairo_t *cr, const View *v, int running)
     cairo_stroke(cr);
 
     if (s->phase == PH_CONNECT || s->phase == PH_PING) {
-        /* indeterminate sweeping arc while waiting */
-        double ph = fmod(v->t * 0.15, 1.0);
+        /* Indeterminate sweeping arc while waiting. Ease it back and
+         * forth so it stays on the track (round cap included) instead of
+         * running past the end and snapping back to the start. */
         double seg = span * 0.15;
-        double start = GAUGE_A0 + span * ph;
+        double cap = 6.0 / GAUGE_R;   /* half of the widest stroke */
+        double travel = 0.5 - 0.5 * cos(v->t * 0.94);
+        double start = GAUGE_A0 + cap + (span - seg - 2.0 * cap) * travel;
         double pulse = 0.38 + 0.22 * sin(v->t * 1.35);
 
         rgba(cr, C_ACCENT, pulse * 0.22);
