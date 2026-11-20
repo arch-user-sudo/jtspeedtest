@@ -5,6 +5,7 @@
  *   jtspeedtestctl '#RRGGBB'          shorthand for the same
  *   jtspeedtestctl quit               exit the window
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,7 +107,14 @@ main(int argc, char *argv[])
     }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    ctl_path(addr.sun_path, sizeof(addr.sun_path));
+    char path[512];
+    ctl_path(path, sizeof path);
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "jtspeedtestctl: control socket path too long\n");
+        close(fd);
+        return 1;
+    }
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr,
                 "jtspeedtestctl: cannot connect to %s (is jtspeedtest running?)\n",
@@ -116,7 +124,15 @@ main(int argc, char *argv[])
     }
 
     size_t len = strlen(msg);
-    ssize_t n = send(fd, msg, len, MSG_NOSIGNAL);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, msg + off, len - off, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        off += (size_t)n;
+    }
     close(fd);
-    return (n >= 0 && (size_t)n == len) ? 0 : 1;
+    return off == len ? 0 : 1;
 }

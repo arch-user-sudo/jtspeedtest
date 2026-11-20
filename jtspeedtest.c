@@ -388,6 +388,7 @@ typedef struct {
     pthread_mutex_t lock;
     Phase phase;
     int running;
+    _Atomic int worker_done; /* set by the worker just before it returns */
     double ping, jitter, dl, ul, live, progress;
     char status[192];
     char server[128];
@@ -436,7 +437,9 @@ static void net_phase(Net *n, Phase phase, const char *status)
     pthread_mutex_lock(&n->lock);
     n->phase = phase;
     n->progress = 0.0;
-    if (phase != PH_DOWNLOAD && phase != PH_UPLOAD)
+    /* Clear the gauge when leaving the download phase; otherwise the last
+     * download speed lingers until the first upload progress update. */
+    if (phase != PH_DOWNLOAD)
         n->live = 0.0;
     if (status)
         snprintf(n->status, sizeof n->status, "%s", status);
@@ -539,6 +542,15 @@ static int xfer_progress(void *user, curl_off_t dltotal, curl_off_t dlnow,
     return 0;
 }
 
+/* Let libcurl abort trace/ping requests promptly on user cancellation;
+ * otherwise the UI would wait for the whole per-request timeout on quit. */
+static int cancel_progress(void *user, curl_off_t dltotal, curl_off_t dlnow,
+                           curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)user; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    return cancelled();
+}
+
 static void curl_common(CURL *c)
 {
     curl_easy_setopt(c, CURLOPT_USERAGENT, TEST_UA);
@@ -577,6 +589,8 @@ static void fetch_trace(Net *n, CURL *c)
                      "https://www.cloudflare.com/cdn-cgi/trace");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, cancel_progress);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 4L);
 
     if (curl_easy_perform(c) != CURLE_OK)
@@ -630,6 +644,8 @@ static int run_ping(Net *n, CURL *c, double *out_ping, double *out_jitter,
         curl_easy_setopt(c, CURLOPT_URL, url);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink_write);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, cancel_progress);
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, 5000L);
 
         CURLcode res = curl_easy_perform(c);
@@ -803,6 +819,10 @@ static int run_upload(Net *n, CURL *c, double *out_mbps,
 
     int ok = res == CURLE_OK && code >= 200 && code < 300 &&
              x.bytes > 262144;
+    /* A timed-out or interrupted upload often has no response code yet
+     * (code == 0), but the bytes actually sent are still a valid speed
+     * measurement.  Requiring 2xx here would turn every slow upload into
+     * "Upload failed: Operation timed out" with no speed shown. */
     int partial = (res == CURLE_OPERATION_TIMEDOUT ||
                    res == CURLE_SEND_ERROR ||
                    res == CURLE_PARTIAL_FILE) &&
@@ -830,7 +850,7 @@ static void *test_worker(void *arg)
     CURL *c = curl_easy_init();
     if (!c) {
         net_error(n, "Could not initialise libcurl");
-        return NULL;
+        goto out; /* must set worker_done so app_reap() can join us */
     }
 
     net_phase(n, PH_CONNECT, "Connecting to Cloudflare…");
@@ -912,6 +932,7 @@ cancelled_out:
 out:
     if (c)
         curl_easy_cleanup(c);
+    atomic_store_explicit(&n->worker_done, 1, memory_order_relaxed);
     return NULL;
 }
 
@@ -1530,7 +1551,8 @@ typedef struct {
 } ShmBuf;
 
 typedef struct {
-    struct wl_output *output;
+    struct wl_output *output; /* NULL when the slot is free */
+    uint32_t global_name;
     int32_t scale;
     int entered;
     App *app;
@@ -1544,6 +1566,7 @@ struct App {
     struct xdg_wm_base *wm_base;
     struct zxdg_decoration_manager_v1 *deco_manager;
     struct wl_seat *seat;
+    uint32_t seat_global; /* registry name of the seat we bound */
     struct wl_pointer *pointer;
     uint32_t pointer_serial;
     struct wl_keyboard *keyboard;
@@ -1579,11 +1602,11 @@ struct App {
     struct xkb_state *xkb_state;
 
     Output outputs[8];
-    int output_count;
 
     Net net;
     pthread_t worker;
     int worker_alive;
+    int pending_start; /* start queued while the previous worker winds down */
 
     double t0;
     double disp;
@@ -1651,9 +1674,14 @@ state_load(App *a)
     char path[512];
     state_path(path, sizeof path);
 
-    FILE *f = fopen(path, "r");
-    if (!f)
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
         return;
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return;
+    }
 
     char line[256];
     while (fgets(line, sizeof line, f)) {
@@ -1661,9 +1689,9 @@ state_load(App *a)
         int value;
         if (sscanf(line, " %63[^= \t] = %d", key, &value) != 2)
             continue;
-        if (!strcmp(key, "width") && value > 0)
+        if (!strcmp(key, "width") && value > 0 && value <= 16384)
             a->state_w = value;
-        else if (!strcmp(key, "height") && value > 0)
+        else if (!strcmp(key, "height") && value > 0 && value <= 16384)
             a->state_h = value;
         else if (!strcmp(key, "maximized"))
             a->state_maximized = value != 0;
@@ -1688,9 +1716,16 @@ state_save(App *a)
         state_mkdir_p(dir);
     }
 
-    FILE *f = fopen(path, "w");
-    if (!f)
+    /* Never follow a planted symlink into an arbitrary file. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0)
         return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
 
     fprintf(f, "width=%d\nheight=%d\nmaximized=%d\n",
             a->state_w, a->state_h, a->state_maximized);
@@ -1719,6 +1754,8 @@ static void update_cursor(App *a)
     if (!a->cursor_shape_device) {
         a->cursor_shape_device = wp_cursor_shape_manager_v1_get_pointer(
             a->cursor_shape_manager, a->pointer);
+        if (!a->cursor_shape_device)
+            return;
         a->cursor_shape = 0;
     }
 
@@ -1738,24 +1775,41 @@ static void update_cursor(App *a)
     }
 }
 
+static void start_test(App *a);
+
 static void app_reap(App *a)
 {
-    if (a->worker_alive && !net_running(&a->net)) {
+    /* Only join once the worker has signalled completion; joining earlier
+     * would block the UI thread on an in-flight curl request. */
+    if (a->worker_alive &&
+        atomic_load_explicit(&a->net.worker_done, memory_order_relaxed)) {
         pthread_join(a->worker, NULL);
         a->worker_alive = 0;
+        if (a->pending_start) {
+            a->pending_start = 0;
+            start_test(a);
+        }
     }
 }
 
 static void start_test(App *a)
 {
+    if (net_running(&a->net))
+        return;
     if (a->worker_alive) {
-        if (net_running(&a->net))
-            return;
-        pthread_join(a->worker, NULL);
-        a->worker_alive = 0;
+        /* The previous run is still winding down.  Queue the new run here
+         * instead of blocking the UI thread in pthread_join(); app_reap()
+         * launches it once the old worker has exited. */
+        a->pending_start = 1;
+        pthread_mutex_lock(&a->net.lock);
+        snprintf(a->net.status, sizeof a->net.status, "Starting…");
+        pthread_mutex_unlock(&a->net.lock);
+        a->dirty = 1;
+        return;
     }
 
     atomic_store_explicit(&g_cancel, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->net.worker_done, 0, memory_order_relaxed);
 
     pthread_mutex_lock(&a->net.lock);
     a->net.phase = PH_CONNECT;
@@ -1763,12 +1817,15 @@ static void start_test(App *a)
     a->net.ping = a->net.jitter = 0.0;
     a->net.dl = a->net.ul = a->net.live = 0.0;
     a->net.progress = 0.0;
+    snprintf(a->net.server, sizeof a->net.server, "Cloudflare");
+    a->net.ip[0] = '\0';
     snprintf(a->net.status, sizeof a->net.status, "Connecting…");
     pthread_mutex_unlock(&a->net.lock);
 
     a->disp = 0.0;
     a->done_t = -1.0;
     a->prev_phase = PH_CONNECT;
+    a->dirty = 1;
 
     if (pthread_create(&a->worker, NULL, test_worker, &a->net) == 0)
         a->worker_alive = 1;
@@ -1778,13 +1835,14 @@ static void start_test(App *a)
 
 static void stop_test(App *a)
 {
+    a->pending_start = 0; /* cancel a queued start as well */
     if (!a->worker_alive)
         return;
 
     atomic_store_explicit(&g_cancel, 1, memory_order_relaxed);
-    pthread_join(a->worker, NULL);
-    a->worker_alive = 0;
-
+    /* Do not join here: a curl request in flight can take seconds to notice
+     * cancellation, and this runs on the UI thread.  app_reap() joins the
+     * worker once it exits. */
     pthread_mutex_lock(&a->net.lock);
     a->net.running = 0;
     a->net.phase = PH_IDLE;
@@ -1794,11 +1852,12 @@ static void stop_test(App *a)
     pthread_mutex_unlock(&a->net.lock);
 
     a->disp = 0.0;
+    a->dirty = 1;
 }
 
 static void toggle_test(App *a)
 {
-    if (net_running(&a->net))
+    if (net_running(&a->net) || a->pending_start)
         stop_test(a);
     else
         start_test(a);
@@ -1866,8 +1925,13 @@ static const struct wl_buffer_listener buffer_listener = {
 
 static int shm_buffer_create(App *a, ShmBuf *b, int w, int h)
 {
+    if (w <= 0 || h <= 0 || w > INT32_MAX / 4)
+        return -1;
     int stride = w * 4;
     size_t size = (size_t)stride * (size_t)h;
+    /* wl_shm_create_pool() takes an int32_t size. */
+    if (size > INT32_MAX)
+        return -1;
     int fd = create_anon_file(size);
     if (fd < 0)
         return -1;
@@ -1948,28 +2012,32 @@ static void request_frame(App *a)
     if (!a->surface || a->frame_cb)
         return;
     a->frame_cb = wl_surface_frame(a->surface);
+    if (!a->frame_cb)
+        return;
     wl_callback_add_listener(a->frame_cb, &frame_listener, a);
 }
 
-static void app_draw(App *a, const Snap *s)
+/* Returns 1 when a frame was actually submitted, 0 otherwise. */
+static int app_draw(App *a, const Snap *s)
 {
     if (!a->configured || !a->surface || !a->shm)
-        return;
+        return 0;
 
-    int w = (int)lround(WIN_W * a->scale);
-    int h = (int)lround(WIN_H * a->scale);
-    if (w < 1 || h < 1)
-        return;
+    double wd = WIN_W * a->scale, hd = WIN_H * a->scale;
+    if (!(wd >= 1.0 && hd >= 1.0 && wd <= 16384.0 && hd <= 16384.0))
+        return 0;
+    int w = (int)lround(wd);
+    int h = (int)lround(hd);
 
     ShmBuf *b = next_buffer(a, w, h);
     if (!b)
-        return;
+        return 0;
 
     cairo_surface_t *surf = cairo_image_surface_create_for_data(
         b->data, CAIRO_FORMAT_ARGB32, w, h, w * 4);
     if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(surf);
-        return;
+        return 0;
     }
 
     cairo_t *cr = cairo_create(surf);
@@ -2000,6 +2068,7 @@ static void app_draw(App *a, const Snap *s)
     request_frame(a);
     wl_surface_commit(a->surface);
     b->busy = 1;
+    return 1;
 }
 
 static void recalc_scale(App *a)
@@ -2008,8 +2077,9 @@ static void recalc_scale(App *a)
         return;
 
     int s = 0;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].entered && a->outputs[i].scale > s)
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].entered &&
+            a->outputs[i].scale > s)
             s = a->outputs[i].scale;
     }
     if (s < 1)
@@ -2171,8 +2241,8 @@ static void surface_enter(void *data, struct wl_surface *surface,
 {
     (void)surface;
     App *a = data;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output == output) {
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].output == output) {
             a->outputs[i].entered = 1;
             break;
         }
@@ -2185,8 +2255,8 @@ static void surface_leave(void *data, struct wl_surface *surface,
 {
     (void)surface;
     App *a = data;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output == output) {
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].output == output) {
             a->outputs[i].entered = 0;
             break;
         }
@@ -2418,7 +2488,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !a->pointer) {
         a->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(a->pointer, &pointer_listener, a);
+        if (a->pointer)
+            wl_pointer_add_listener(a->pointer, &pointer_listener, a);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && a->pointer) {
         if (a->cursor_shape_device) {
             wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
@@ -2431,7 +2502,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !a->keyboard) {
         a->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(a->keyboard, &keyboard_listener, a);
+        if (a->keyboard)
+            wl_keyboard_add_listener(a->keyboard, &keyboard_listener, a);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && a->keyboard) {
         wl_keyboard_destroy(a->keyboard);
         a->keyboard = NULL;
@@ -2448,6 +2520,28 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
+static void release_seat(App *a)
+{
+    if (a->cursor_shape_device) {
+        wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
+        a->cursor_shape_device = NULL;
+        a->cursor_shape = 0;
+    }
+    if (a->pointer) {
+        wl_pointer_destroy(a->pointer);
+        a->pointer = NULL;
+    }
+    if (a->keyboard) {
+        wl_keyboard_destroy(a->keyboard);
+        a->keyboard = NULL;
+    }
+    if (a->seat) {
+        wl_seat_destroy(a->seat);
+        a->seat = NULL;
+    }
+    a->seat_global = 0;
+}
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version)
@@ -2455,16 +2549,23 @@ static void registry_global(void *data, struct wl_registry *registry,
     App *a = data;
 
     if (!strcmp(interface, wl_compositor_interface.name)) {
-        a->compositor = wl_registry_bind(registry, name,
-                                         &wl_compositor_interface,
-                                         version < 4 ? version : 4);
+        if (!a->compositor)
+            a->compositor = wl_registry_bind(registry, name,
+                                             &wl_compositor_interface,
+                                             version < 4 ? version : 4);
     } else if (!strcmp(interface, wl_shm_interface.name)) {
-        a->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-        wl_shm_add_listener(a->shm, &shm_listener, a);
+        if (!a->shm) {
+            a->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+            if (a->shm)
+                wl_shm_add_listener(a->shm, &shm_listener, a);
+        }
     } else if (!strcmp(interface, xdg_wm_base_interface.name)) {
-        a->wm_base = wl_registry_bind(registry, name,
-                                      &xdg_wm_base_interface, 1);
-        xdg_wm_base_add_listener(a->wm_base, &wm_base_listener, a);
+        if (!a->wm_base) {
+            a->wm_base = wl_registry_bind(registry, name,
+                                          &xdg_wm_base_interface, 1);
+            if (a->wm_base)
+                xdg_wm_base_add_listener(a->wm_base, &wm_base_listener, a);
+        }
     } else if (!strcmp(interface,
                        zxdg_decoration_manager_v1_interface.name)) {
         a->deco_manager = wl_registry_bind(
@@ -2478,20 +2579,32 @@ static void registry_global(void *data, struct wl_registry *registry,
         a->cursor_shape_manager = wl_registry_bind(
             registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
+        /* Only one seat is tracked.  Binding every seat into a->seat would
+         * make several seats fight over the single pointer/keyboard. */
+        if (a->seat)
+            return;
         a->seat = wl_registry_bind(registry, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
-        wl_seat_add_listener(a->seat, &seat_listener, a);
+        if (a->seat) {
+            a->seat_global = name;
+            wl_seat_add_listener(a->seat, &seat_listener, a);
+        }
     } else if (!strcmp(interface, wl_output_interface.name)) {
-        if (a->output_count < MAX_OUTPUTS) {
-            Output *o = &a->outputs[a->output_count];
+        for (int i = 0; i < MAX_OUTPUTS; i++) {
+            Output *o = &a->outputs[i];
+            if (o->output)
+                continue;
             o->output = wl_registry_bind(registry, name,
                                          &wl_output_interface,
                                          version < 2 ? version : 2);
+            if (!o->output)
+                return;
+            o->global_name = name;
             o->scale = 1;
             o->entered = 0;
             o->app = a;
             wl_output_add_listener(o->output, &output_listener, o);
-            a->output_count++;
+            break;
         }
     }
 }
@@ -2499,7 +2612,21 @@ static void registry_global(void *data, struct wl_registry *registry,
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    (void)data; (void)registry; (void)name;
+    (void)registry;
+    App *a = data;
+    if (a->seat && name == a->seat_global)
+        release_seat(a);
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        Output *o = &a->outputs[i];
+        if (!o->output || o->global_name != name)
+            continue;
+        wl_output_destroy(o->output);
+        o->output = NULL;
+        o->entered = 0;
+        /* Drop the removed output's scale immediately; do not wait for a
+         * surface.leave that some compositors never send. */
+        recalc_scale(a);
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -2546,8 +2673,10 @@ static int wayland_start(App *a)
     }
 
     a->xdg_surface = xdg_wm_base_get_xdg_surface(a->wm_base, a->surface);
+    if (!a->xdg_surface) return 0;
     xdg_surface_add_listener(a->xdg_surface, &xdg_surface_listener, a);
     a->toplevel = xdg_surface_get_toplevel(a->xdg_surface);
+    if (!a->toplevel) return 0;
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Speedtest");
     xdg_toplevel_set_app_id(a->toplevel, "jtspeedtest");
@@ -2567,10 +2696,12 @@ static int wayland_start(App *a)
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
             a->deco_manager, a->toplevel);
-        zxdg_toplevel_decoration_v1_add_listener(
-            a->decoration, &decoration_listener, a);
-        zxdg_toplevel_decoration_v1_set_mode(
-            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        if (a->decoration) {
+            zxdg_toplevel_decoration_v1_add_listener(
+                a->decoration, &decoration_listener, a);
+            zxdg_toplevel_decoration_v1_set_mode(
+                a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        }
     }
 
     if (a->icon_manager) {
@@ -2667,7 +2798,10 @@ static void
 ctl_read_client(App *a)
 {
     char buf[128];
-    for (;;) {
+    /* Bound the work done per event-loop turn: a peer that keeps writing
+     * newline-terminated commands must not starve Wayland events forever.
+     * The fd is non-blocking, so leftover data is picked up next turn. */
+    for (int budget = 32; budget > 0; budget--) {
         ssize_t n = read(a->ctl_client_fd, buf, sizeof(buf));
         if (n > 0) {
             size_t room = sizeof(a->ctl_buf) - 1 - a->ctl_len;
@@ -2699,7 +2833,8 @@ ctl_read_client(App *a)
 static void
 ctl_accept(App *a)
 {
-    for (;;) {
+    /* Likewise cap accepts per turn so a connection flood cannot spin here. */
+    for (int budget = 8; budget > 0; budget--) {
         int fd = accept4(a->ctl_fd, NULL, NULL,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
@@ -2736,7 +2871,12 @@ ctl_start(App *a)
         perror("jtspeedtest: control socket");
         return 0;
     }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    /* A Unix socket's mode is fixed at bind() from the umask.  Without this
+     * it is world-connectable when XDG_RUNTIME_DIR falls back to /tmp. */
+    mode_t old_umask = umask(0077);
+    int bound = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (bound < 0) {
         fprintf(stderr, "jtspeedtest: cannot bind %s: %s\n",
                 path, strerror(errno));
         close(fd);
@@ -2846,14 +2986,7 @@ static void app_cleanup(App *a)
         a->worker_alive = 0;
     }
 
-    if (a->keyboard)
-        wl_keyboard_destroy(a->keyboard);
-    if (a->cursor_shape_device) {
-        wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
-        a->cursor_shape_device = NULL;
-    }
-    if (a->pointer)
-        wl_pointer_destroy(a->pointer);
+    release_seat(a);
     if (a->cursor_shape_manager)
         wp_cursor_shape_manager_v1_destroy(a->cursor_shape_manager);
     if (a->decoration)
@@ -2864,8 +2997,6 @@ static void app_cleanup(App *a)
         xdg_surface_destroy(a->xdg_surface);
     if (a->surface)
         wl_surface_destroy(a->surface);
-    if (a->seat)
-        wl_seat_destroy(a->seat);
     if (a->deco_manager)
         zxdg_decoration_manager_v1_destroy(a->deco_manager);
     if (a->icon_manager)
@@ -2877,9 +3008,11 @@ static void app_cleanup(App *a)
     if (a->compositor)
         wl_compositor_destroy(a->compositor);
 
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output)
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output) {
             wl_output_destroy(a->outputs[i].output);
+            a->outputs[i].output = NULL;
+        }
     }
     if (a->registry)
         wl_registry_destroy(a->registry);
@@ -3005,9 +3138,10 @@ int main(int argc, char **argv)
 
     const char *scale_env = getenv("JTSPEEDTEST_SCALE");
     if (scale_env && *scale_env) {
-        int s = (int)lround(atof(scale_env));
-        if (s < 1) s = 1;
-        if (s > 3) s = 3;
+        double raw = atof(scale_env);
+        if (!isfinite(raw) || raw < 1.0) raw = 1.0;
+        if (raw > 3.0) raw = 3.0;
+        int s = (int)lround(raw);
         a.scale = s;
         a.fixed_scale = 1;
     }
@@ -3027,6 +3161,7 @@ int main(int argc, char **argv)
     curl_global_init(CURL_GLOBAL_DEFAULT);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
     if (!wayland_start(&a)) {
@@ -3081,10 +3216,16 @@ int main(int argc, char **argv)
         double interval = (s.running || fabs(target - a.disp) > 0.01)
                           ? 1.0 / 30.0 : 1.0 / 15.0;
         int due = a.dirty || now - a.last_draw >= interval;
+        int draw_failed = 0;
         if (a.configured && due && !a.frame_cb) {
-            app_draw(&a, &s);
-            a.dirty = 0;
-            a.last_draw = now;
+            /* Keep dirty set when no frame could be submitted (all buffers
+             * busy, setup failure), so the next turn retries promptly. */
+            if (app_draw(&a, &s)) {
+                a.dirty = 0;
+                a.last_draw = now;
+            } else {
+                draw_failed = 1;
+            }
         }
 
         /* Pending frame callbacks wake us at the next refresh, so resizes
@@ -3100,6 +3241,10 @@ int main(int argc, char **argv)
             if (wait < 0.0)
                 wait = 0.0;
             timeout = (int)(wait * 1000.0) + 1;
+            /* The draw above failed (all buffers busy); pace the retry
+             * instead of spinning at 1 ms. wl_buffer.release wakes poll(). */
+            if (draw_failed && timeout < 16)
+                timeout = 16;
         }
 
         if (pump_events(&a, timeout) < 0)
